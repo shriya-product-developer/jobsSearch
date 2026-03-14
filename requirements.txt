@@ -1,0 +1,4 @@
+google-genai
+requests
+resend
+google-search-results
