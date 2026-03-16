@@ -1,4 +1,6 @@
 google-genai
 requests
 resend
+firebase-admin
+flask
 google-search-results

@@ -4,6 +4,7 @@
 import os
 import re
 import json
+import hashlib
 import requests
 import xml.etree.ElementTree as ET
 import resend
@@ -11,14 +12,34 @@ from datetime import date
 from google import genai
 from google.genai import types
 from serpapi import GoogleSearch
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-RESEND_API_KEY = os.environ["RESEND_API_KEY"]
-SERPAPI_KEY    = os.environ["SERPAPI_KEY"]
-TO_EMAIL       = os.environ["TO_EMAIL"]
-FROM_EMAIL     = "onboarding@resend.dev"
+GEMINI_API_KEY        = os.environ["GEMINI_API_KEY"]
+RESEND_API_KEY        = os.environ["RESEND_API_KEY"]
+SERPAPI_KEY           = os.environ["SERPAPI_KEY"]
+TO_EMAIL              = os.environ["TO_EMAIL"]
+FROM_EMAIL            = "onboarding@resend.dev"
+FIREBASE_PROJECT_ID   = os.environ["FIREBASE_PROJECT_ID"]
+FIREBASE_CLIENT_EMAIL = os.environ["FIREBASE_CLIENT_EMAIL"]
+FIREBASE_PRIVATE_KEY  = os.environ["FIREBASE_PRIVATE_KEY"].replace("\\n", "\n")
+DASHBOARD_URL         = os.environ.get("DASHBOARD_URL", "#")
 
 resend.api_key = RESEND_API_KEY
+
+# Initialise Firebase
+if not firebase_admin._apps:
+    cred = credentials.Certificate({
+        "type":          "service_account",
+        "project_id":    FIREBASE_PROJECT_ID,
+        "client_email":  FIREBASE_CLIENT_EMAIL,
+        "private_key":   FIREBASE_PRIVATE_KEY,
+        "token_uri":     "https://oauth2.googleapis.com/token",
+    })
+    firebase_admin.initialize_app(cred)
+
+db               = firestore.client()
+SEEN_COLLECTION  = "seen_jobs"
 
 CV_SUMMARY = """
 Name: Raghav Malhotra
@@ -42,12 +63,53 @@ Awards: $15,000 merit scholarship, University of Sydney
 
 today_str = date.today().strftime("%A, %B %d, %Y")
 
-CITIES = [
-    {"name": "Sydney",    "seek_location": "Sydney+NSW",        "serp_location": "Sydney, New South Wales, Australia"},
-    {"name": "Melbourne", "seek_location": "Melbourne+VIC",     "serp_location": "Melbourne, Victoria, Australia"},
-    {"name": "Brisbane",  "seek_location": "Brisbane+QLD",      "serp_location": "Brisbane, Queensland, Australia"},
-    {"name": "Perth",     "seek_location": "Perth+WA",          "serp_location": "Perth, Western Australia, Australia"},
-]
+
+# ════════════════════════════════════════════════════════════════════
+# FIRESTORE HELPERS
+# ════════════════════════════════════════════════════════════════════
+def get_seen_urls() -> set:
+    """Fetch all job URLs already shown to Raghav."""
+    docs = db.collection(SEEN_COLLECTION).stream()
+    return {doc.to_dict().get("url", "") for doc in docs}
+
+
+def save_seen_urls(jobs: list[dict]):
+    """Save newly shown jobs to Firestore with full metadata."""
+    batch = db.batch()
+    for job in jobs:
+        url = job.get("url", "")
+        if not url:
+            continue
+        doc_id = hashlib.md5(url.encode()).hexdigest()
+        ref    = db.collection(SEEN_COLLECTION).document(doc_id)
+        batch.set(ref, {
+            "url":        url,
+            "title":      job.get("title", ""),
+            "company":    job.get("company", ""),
+            "location":   job.get("location", ""),
+            "city":       job.get("city", ""),
+            "source":     job.get("source", ""),
+            "first_seen": date.today().isoformat(),
+            "status":     "new",
+        }, merge=True)
+    batch.commit()
+    print(f"[Firestore] Saved {len(jobs)} new jobs")
+
+
+def filter_new_jobs(cities_data: dict, seen_urls: set) -> tuple[dict, list[dict]]:
+    """Remove already-seen jobs. Returns filtered data and new job dicts."""
+    new_jobs = []
+    for city_name, city_info in cities_data.items():
+        original = city_info.get("jobs", [])
+        filtered = [j for j in original if j.get("url", "") not in seen_urls]
+        skipped  = len(original) - len(filtered)
+        if skipped > 0:
+            print(f"  [{city_name}] Skipped {skipped} already-seen job(s)")
+        for job in filtered:
+            job["city"] = city_name
+        city_info["jobs"] = filtered
+        new_jobs.extend(filtered)
+    return cities_data, new_jobs
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -341,7 +403,10 @@ def run_agent() -> dict:
             except json.JSONDecodeError:
                 print("[Warning] Gemini returned no JSON")
                 return {
-                    "cities": {c: {"jobs": [], "total_reviewed": 0} for c in ["Sydney", "Melbourne", "Brisbane", "Perth"]},
+                    "cities": {
+                        c: {"jobs": [], "total_reviewed": 0}
+                        for c in ["Sydney", "Melbourne", "Brisbane", "Perth"]
+                    },
                     "total_searches": 0,
                     "error": raw[:500]
                 }
@@ -403,11 +468,11 @@ def format_html_email(data: dict) -> tuple[str, str]:
     total_jobs    = 0
 
     for city_name in ["Sydney", "Melbourne", "Brisbane", "Perth"]:
-        city_info     = cities_data.get(city_name, {})
-        jobs          = city_info.get("jobs", [])
+        city_info      = cities_data.get(city_name, {})
+        jobs           = city_info.get("jobs", [])
         total_reviewed = city_info.get("total_reviewed", 0)
-        city_color    = city_colours.get(city_name, "#534AB7")
-        total_jobs   += len(jobs)
+        city_color     = city_colours.get(city_name, "#534AB7")
+        total_jobs    += len(jobs)
 
         job_blocks = ""
         for job in jobs:
@@ -489,12 +554,21 @@ def format_html_email(data: dict) -> tuple[str, str]:
                           line-height:1.7;">{sop_html}</p>
               </div>
 
-              <a href="{job.get('url', '#')}"
-                 style="display:inline-block; margin-top:4px; padding:8px 20px;
-                        background:#1a1a1a; color:#fff; font-size:12px;
-                        font-weight:600; text-decoration:none; border-radius:8px;">
-                Apply Now
-              </a>
+              <div style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;">
+                <a href="{job.get('url', '#')}"
+                   style="display:inline-block; padding:8px 20px;
+                          background:#1a1a1a; color:#fff; font-size:12px;
+                          font-weight:600; text-decoration:none; border-radius:8px;">
+                  Apply Now
+                </a>
+                <a href="{DASHBOARD_URL}"
+                   style="display:inline-block; padding:8px 20px; background:#fff;
+                          color:#534AB7; font-size:12px; font-weight:600;
+                          text-decoration:none; border-radius:8px;
+                          border:1px solid #534AB7;">
+                  Track Application
+                </a>
+              </div>
             </div>
             """
 
@@ -502,30 +576,25 @@ def format_html_email(data: dict) -> tuple[str, str]:
         if not jobs:
             no_jobs_msg = """
             <p style="color:#888; font-size:13px; font-style:italic; padding:16px 0;">
-              No matching roles found today in this city.
+              No new roles found today in this city.
             </p>
             """
 
         city_sections += f"""
         <div style="margin-bottom:32px;">
-
-          <!-- City header -->
           <div style="background:{city_color}; padding:14px 20px;
                       border-radius:10px 10px 0 0; display:flex;
                       justify-content:space-between; align-items:center;">
             <h2 style="margin:0; color:#fff; font-size:18px;
                        font-weight:700;">{city_name}</h2>
             <span style="color:rgba(255,255,255,0.7); font-size:12px;">
-              {len(jobs)} matched · {total_reviewed} reviewed
+              {len(jobs)} new matches · {total_reviewed} reviewed
             </span>
           </div>
-
-          <div style="background:#f9f9f9; padding:16px;
-                      border:1px solid #eee; border-top:none;
-                      border-radius:0 0 10px 10px;">
+          <div style="background:#f9f9f9; padding:16px; border:1px solid #eee;
+                      border-top:none; border-radius:0 0 10px 10px;">
             {job_blocks or no_jobs_msg}
           </div>
-
         </div>
         """
 
@@ -534,14 +603,13 @@ def format_html_email(data: dict) -> tuple[str, str]:
                        font-family:-apple-system, BlinkMacSystemFont, sans-serif;">
       <div style="max-width:660px; margin:32px auto;">
 
-        <!-- Main header -->
         <div style="background:#1a1a1a; padding:28px 32px;
                     border-radius:12px 12px 0 0;">
           <p style="margin:0; color:#aaa; font-size:13px;">{today_str}</p>
           <h1 style="margin:6px 0 0; color:#fff; font-size:24px;
                      font-weight:700;">Your Daily Job Matches</h1>
           <p style="margin:6px 0 0; color:#888; font-size:13px;">
-            {total_jobs} roles across 4 cities · {total_searches} searches performed
+            {total_jobs} new roles across 4 cities · {total_searches} searches
           </p>
           <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap;">
             <span style="background:#534AB7; color:#fff; font-size:11px;
@@ -555,18 +623,22 @@ def format_html_email(data: dict) -> tuple[str, str]:
           </div>
         </div>
 
-        <!-- City sections -->
         <div style="padding:24px; background:#f0f0f0;">
           {city_sections}
         </div>
 
-        <!-- Footer -->
         <div style="background:#fff; padding:20px 32px;
                     border-top:1px solid #eee; border-radius:0 0 12px 12px;">
           <p style="margin:0; color:#aaa; font-size:12px;">
             Matched to Raghav's CV automatically · {today_str}<br>
             Sources: Seek, LinkedIn (via SerpAPI), Google Jobs
           </p>
+          <a href="{DASHBOARD_URL}"
+             style="display:inline-block; margin-top:10px; padding:8px 20px;
+                    background:#534AB7; color:#fff; font-size:12px;
+                    font-weight:600; text-decoration:none; border-radius:8px;">
+            Open Job Tracker Dashboard
+          </a>
         </div>
 
       </div>
@@ -599,29 +671,48 @@ def main():
     print(f"  JOB AGENT — {today_str}")
     print(f"{'='*60}\n")
 
-    print("[Stage 1/3] Searching for jobs across 4 cities...")
+    # Load already-seen URLs from Firestore
+    print("[Firestore] Loading seen jobs...")
+    seen_urls = get_seen_urls()
+    print(f"[Firestore] {len(seen_urls)} jobs already seen — will skip these\n")
+
+    # Stage 1: Search
+    print("[Stage 1/4] Searching for jobs across 4 cities...")
     job_data = run_agent()
+    cities   = job_data.get("cities", {})
 
-    cities      = job_data.get("cities", {})
     total_found = sum(len(c.get("jobs", [])) for c in cities.values())
-
     if total_found == 0:
         print(f"[Error] No jobs found. Reason: {job_data.get('error', 'Unknown')}")
         print("[Hint] Check your SERPAPI_KEY and internet connection")
         return
 
+    # Stage 2: Filter out already-seen jobs
+    print("[Stage 2/4] Filtering out already-seen jobs...")
+    cities, new_jobs = filter_new_jobs(cities, seen_urls)
+    job_data["cities"] = cities
+
+    total_new = sum(len(c.get("jobs", [])) for c in cities.values())
+    if total_new == 0:
+        print("[Info] No new jobs today — all results already seen. Skipping email.")
+        return
+
     for city, info in cities.items():
-        print(f"  {city}: {len(info.get('jobs', []))} matched roles")
+        print(f"  {city}: {len(info.get('jobs', []))} new roles")
+    print(f"\n[Stage 2/4] {total_new} new jobs after filtering\n")
 
-    print(f"\n[Stage 1/3] Found {total_found} total matched roles\n")
-
-    print("[Stage 2/3] Formatting email...")
+    # Stage 3: Format email
+    print("[Stage 3/4] Formatting email...")
     subject, html = format_html_email(job_data)
 
-    print("[Stage 3/3] Sending email...")
+    # Stage 4: Send email
+    print("[Stage 4/4] Sending email...")
     send_email(subject, html)
 
-    print(f"\n[Done] Job matches delivered to {TO_EMAIL}")
+    # Save new job URLs to Firestore so they are skipped tomorrow
+    save_seen_urls(new_jobs)
+
+    print(f"\n[Done] {total_new} new job matches delivered to {TO_EMAIL}")
 
 
 if __name__ == "__main__":

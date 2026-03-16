@@ -5,3 +5,8 @@ services:
     schedule: "0 22 * * *"
     buildCommand: pip install -r requirements.txt
     startCommand: python job_workflow.py
+  - type: web
+    name: job-dashboard
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python dashboard.py
